@@ -1,0 +1,12 @@
+name: audioclipperx
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - ffmpeg
+  - pip
+  - pip:
+      - pydub
+      - ffmpeg-python
+      - PySide6
