@@ -159,9 +159,9 @@ The UI locks during processing. Each file is handled in a separate worker proces
 
 ---
 
-## Example: BYD car lock sound
+## Example: car lock sound
 
-The BYD Encore custom lock sound requires:
+The Encore custom lock sound requires:
 
 | Requirement | Value |
 |-------------|-------|
