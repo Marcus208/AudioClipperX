@@ -34,7 +34,7 @@ A Python desktop tool for trimming audio clips, converting formats, and batch-pr
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yourname/AudioClipperX.git
+git clone https://github.com/Marcus208/AudioClipperX.git
 cd AudioClipperX
 ```
 
