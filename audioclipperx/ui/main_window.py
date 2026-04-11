@@ -73,6 +73,7 @@ class MainWindow(QMainWindow):
         self.player = PlayerWidget()
         self.player.range_changed.connect(self._on_range_changed)
         self.player._player.durationChanged.connect(self._on_duration_loaded)
+        self.file_list.file_removed.connect(self.player.evict_waveform)
         splitter.addWidget(self.player)
 
         splitter.setSizes([560, 360])

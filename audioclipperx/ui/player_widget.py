@@ -2,7 +2,7 @@ import os
 import re
 from typing import Optional
 
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget,
@@ -10,6 +10,8 @@ from PySide6.QtWidgets import (
 
 from audioclipperx.ui.range_slider import RangeSlider
 
+
+# ── time helpers ─────────────────────────────────────────────────────────
 
 def _ms_to_str(ms: int) -> str:
     s_total = ms // 1000
@@ -24,22 +26,17 @@ def _ms_to_str(ms: int) -> str:
 def _str_to_ms(text: str) -> Optional[int]:
     """Parse user-typed time into milliseconds.
     Accepts: 90  /  90.5  /  1:30  /  1:30.5  /  0:01:30
-    Returns None if the string cannot be parsed.
+    Returns None if unparseable.
     """
     text = text.strip()
-    # HH:MM:SS or HH:MM:SS.s
     m = re.fullmatch(r"(\d+):(\d+):(\d+)(?:\.(\d))?", text)
     if m:
         h, mn, s, d = m.groups()
-        ms = (int(h) * 3600 + int(mn) * 60 + int(s)) * 1000
-        return ms + int(d or 0) * 100
-    # MM:SS or MM:SS.s
+        return (int(h) * 3600 + int(mn) * 60 + int(s)) * 1000 + int(d or 0) * 100
     m = re.fullmatch(r"(\d+):(\d+)(?:\.(\d))?", text)
     if m:
         mn, s, d = m.groups()
-        ms = (int(mn) * 60 + int(s)) * 1000
-        return ms + int(d or 0) * 100
-    # plain seconds (integer or decimal)
+        return (int(mn) * 60 + int(s)) * 1000 + int(d or 0) * 100
     m = re.fullmatch(r"(\d+)(?:\.(\d+))?", text)
     if m:
         sec, dec = m.groups()
@@ -47,10 +44,52 @@ def _str_to_ms(text: str) -> Optional[int]:
     return None
 
 
-class _TimeEdit(QLineEdit):
-    """Single-line time editor that emits a validated ms value on commit."""
+# ── waveform loader (background thread) ──────────────────────────────────
 
-    committed = Signal(int)  # emits ms value when user presses Enter or leaves field
+class WaveformLoader(QThread):
+    """Reads audio samples in a background thread and emits normalised amplitude data."""
+
+    waveform_ready = Signal(str, list)  # (path, normalised_peaks)
+
+    def __init__(self, path: str, num_points: int = 1000, parent=None):
+        super().__init__(parent)
+        self._path = path
+        self._num_points = num_points
+
+    def run(self) -> None:
+        try:
+            from pydub import AudioSegment
+
+            # Load and convert to mono for display
+            audio = AudioSegment.from_file(self._path).set_channels(1)
+            raw = audio.get_array_of_samples()
+            n = len(raw)
+            if n == 0:
+                return
+
+            bucket = max(1, n // self._num_points)
+            peaks: list[float] = []
+            for i in range(self._num_points):
+                s = i * bucket
+                e = min(s + bucket, n)
+                if s >= n:
+                    peaks.append(0.0)
+                    continue
+                chunk = raw[s:e]
+                peaks.append(float(max(abs(int(v)) for v in chunk)))
+
+            mx = max(peaks) or 1.0
+            self.waveform_ready.emit(self._path, [v / mx for v in peaks])
+        except Exception:
+            pass  # Waveform is decorative; silently skip on failure
+
+
+# ── editable time field ───────────────────────────────────────────────────
+
+class _TimeEdit(QLineEdit):
+    """Single-line time editor; emits a validated ms value on commit."""
+
+    committed = Signal(int)
 
     def __init__(self, placeholder: str, parent=None):
         super().__init__(parent)
@@ -60,7 +99,6 @@ class _TimeEdit(QLineEdit):
         self.editingFinished.connect(self._commit)
 
     def set_ms(self, ms: Optional[int], duration: int) -> None:
-        """Update the displayed value; show blank when at the natural boundary."""
         if ms is None or ms <= 0:
             self.setText("")
         elif ms >= duration > 0:
@@ -78,20 +116,23 @@ class _TimeEdit(QLineEdit):
             self.clearFocus()
             self.committed.emit(ms)
         else:
-            # Flash red briefly to signal parse failure
             self.setStyleSheet("border: 1px solid red;")
             self.setStyleSheet("")
 
 
-class PlayerWidget(QWidget):
-    """Audio player with a dual-handle range slider for setting clip start/end."""
+# ── main widget ───────────────────────────────────────────────────────────
 
-    # Emits (start_ms, end_ms); 0 / duration acts as a sentinel for "not set"
+class PlayerWidget(QWidget):
+    """Audio player with waveform display, dual clip handles, and draggable position."""
+
+    # Emits (start_ms, end_ms); 0 / duration is the sentinel for "not set"
     range_changed = Signal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_path: Optional[str] = None
+        self._waveform_loader: Optional[WaveformLoader] = None
+        self._waveform_cache: dict[str, list[float]] = {}
         self._setup_player()
         self._setup_ui()
         self._connect_signals()
@@ -110,8 +151,9 @@ class PlayerWidget(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # Range slider
+        # Range slider (waveform + clip handles + position line)
         self.slider = RangeSlider()
+        self.slider.setMinimumHeight(60)
         layout.addWidget(self.slider)
 
         # Playback controls row
@@ -155,7 +197,15 @@ class PlayerWidget(QWidget):
         self._reset_btn.clicked.connect(self._reset_range)
         self._start_edit.committed.connect(self._on_start_typed)
         self._end_edit.committed.connect(self._on_end_typed)
+
+        # Clip handle signals
         self.slider.range_changed.connect(self._on_slider_range_changed)
+
+        # Position drag signals: pause on drag start, seek on drag move
+        self.slider.seek_started.connect(self._on_seek_started)
+        self.slider.seek_requested.connect(self._on_seek_requested)
+
+        # Player signals
         self._player.positionChanged.connect(self._on_position_changed)
         self._player.durationChanged.connect(self._on_duration_changed)
         self._player.playbackStateChanged.connect(self._on_state_changed)
@@ -169,27 +219,54 @@ class PlayerWidget(QWidget):
         self.setEnabled(True)
         self._play_btn.setText("\u25b6")
 
+        # Serve from cache if already sampled; otherwise load in background
+        if path in self._waveform_cache:
+            self.slider.set_waveform(self._waveform_cache[path])
+        else:
+            self.slider.set_waveform([])
+            self._start_waveform_loader(path)
+
     def restore_range(self, start_ms: Optional[int], end_ms: Optional[int]) -> None:
         """Restore a previously saved clip range once the player knows the duration."""
         duration = self._player.duration()
         if duration <= 0:
             return
         s = start_ms if start_ms is not None else 0
-        e = end_ms if end_ms is not None else duration
+        e = end_ms   if end_ms   is not None else duration
         self.slider.set_range(s, e)
         self._update_edits()
 
+    def evict_waveform(self, path: str) -> None:
+        """Release cached waveform data for a file that has been removed from the list."""
+        self._waveform_cache.pop(path, None)
+
     def get_range(self) -> tuple[Optional[int], Optional[int]]:
-        """Return (start_ms, end_ms); None means from the beginning / to the end."""
         duration = self._player.duration()
         s = self.slider.start_ms
         e = self.slider.end_ms
         return (
-            s if s > 0 else None,
+            s if s > 0          else None,
             e if duration > 0 and e < duration else None,
         )
 
-    # ── slots ────────────────────────────────────────────────────────────
+    # ── waveform loading ─────────────────────────────────────────────────
+
+    def _start_waveform_loader(self, path: str) -> None:
+        if self._waveform_loader and self._waveform_loader.isRunning():
+            self._waveform_loader.waveform_ready.disconnect()
+            self._waveform_loader.quit()
+
+        self._waveform_loader = WaveformLoader(path, num_points=1000, parent=self)
+        self._waveform_loader.waveform_ready.connect(self._on_waveform_ready)
+        self._waveform_loader.start()
+
+    def _on_waveform_ready(self, path: str, data: list[float]) -> None:
+        # Store in cache regardless of current file, then apply if still active
+        self._waveform_cache[path] = data
+        if path == self._current_path:
+            self.slider.set_waveform(data)
+
+    # ── playback slots ───────────────────────────────────────────────────
 
     def _toggle_play(self) -> None:
         if self._player.playbackState() == QMediaPlayer.PlayingState:
@@ -227,7 +304,6 @@ class PlayerWidget(QWidget):
 
     def _on_end_typed(self, ms: int) -> None:
         duration = self._player.duration()
-        # 0 means clear the end point (use full duration)
         if ms == 0:
             ms = duration
         ms = max(0, min(ms, duration))
@@ -239,12 +315,21 @@ class PlayerWidget(QWidget):
         self._update_edits()
         self._emit_range()
 
+    def _on_seek_started(self) -> None:
+        """Pause playback when user starts dragging the position indicator."""
+        if self._player.playbackState() == QMediaPlayer.PlayingState:
+            self._player.pause()
+
+    def _on_seek_requested(self, ms: int) -> None:
+        """Seek to position while user drags the position indicator."""
+        self._player.setPosition(ms)
+
     def _on_position_changed(self, pos_ms: int) -> None:
         duration = self._player.duration()
         self.slider.set_position(pos_ms)
         self._time_lbl.setText(f"{_ms_to_str(pos_ms)} / {_ms_to_str(duration)}")
 
-        # Auto-pause when playback reaches the clip end, then rewind to clip start
+        # Auto-pause at clip end and rewind to clip start
         end = self.slider.end_ms
         if (
             end > 0
@@ -270,9 +355,6 @@ class PlayerWidget(QWidget):
         self.range_changed.emit(self.slider.start_ms, self.slider.end_ms)
 
     def _update_edits(self) -> None:
-        """Sync the editable text fields with the current slider values."""
         duration = self._player.duration()
-        s = self.slider.start_ms
-        e = self.slider.end_ms
-        self._start_edit.set_ms(s, duration)
-        self._end_edit.set_ms(e, duration)
+        self._start_edit.set_ms(self.slider.start_ms, duration)
+        self._end_edit.set_ms(self.slider.end_ms, duration)

@@ -44,7 +44,8 @@ def _ms_to_display(ms: Optional[int]) -> str:
 
 
 class FileListWidget(QTableWidget):
-    file_selected = Signal(str)  # emitted with input_path when a row is clicked
+    file_selected = Signal(str)   # emitted with input_path when a row is clicked
+    file_removed  = Signal(str)   # emitted with input_path when a row is removed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -206,8 +207,10 @@ class FileListWidget(QTableWidget):
 
         if action == act_remove:
             # Remove from list only — the file on disk is never touched
+            removed_path = self.entries[row].input_path
             self.entries.pop(row)
             self._refresh()
+            self.file_removed.emit(removed_path)
         elif action == act_edit:
             self._edit_params(row)
         elif action == act_reset:
